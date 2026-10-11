@@ -19,6 +19,9 @@ import freechips.rocketchip.rocket.CoreInterrupts
 import sodor.stage5.Constants._
 import sodor.common._
 
+import eventtrace.{EventTrace, Utils}
+import eventtrace.EventTrace.syntax._
+
 class DatToCtlIo(implicit val conf: SodorCoreParams) extends Bundle()
 {
    val dec_inst    = Output(UInt(conf.xprlen.W))
@@ -116,6 +119,10 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    val wb_reg_wbdata         = Reg(UInt(conf.xprlen.W))
    val wb_reg_ctrl_rf_wen    = RegInit(false.B)
 
+   // Event tracing: the instructions between entering Decode and leaving the pipeline. Each event that moves or
+   // removes an instruction sits in the update branch it describes, so its enable is that branch's condition.
+   val active = EventTrace.collection(new Instruction)
+
 
    //**********************************
    // Instruction Fetch Stage
@@ -182,6 +189,12 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    {
       dec_reg_valid := false.B
       dec_reg_inst := BUBBLE
+
+      // An exception, an interrupt, or an ecall, ebreak, or mret in Memory drops the instructions in Decode and
+      // Execute.
+      active.where(i => i.stage === Stage.Decode || i.stage === Stage.Execute).each { i =>
+         i.event("flush") { active.remove(i); i.destroy() }
+      }
    }
    .elsewhen (!io.ctl.dec_stall && !io.ctl.full_stall)
    {
@@ -194,6 +207,13 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
       {
          dec_reg_valid := true.B
          dec_reg_inst := if_buffer_out.bits.data
+
+         Instruction.create(event = "decode") { i =>
+            i.pc    := if_pc_buffer_out.bits
+            i.bits  := if_buffer_out.bits.data
+            i.stage := Stage.Decode
+            active.add(i)
+         }
       }
       .otherwise
       {
@@ -336,6 +356,14 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
          exe_reg_ctrl_mem_fcn  := M_X
          exe_reg_ctrl_csr_cmd  := CSR.N
          exe_reg_ctrl_br_type  := BR_N
+
+         // A taken branch or jump in Execute drops the instruction in Decode.
+         when (dec_reg_valid)
+         {
+            val squashed = active.where(_.stage === Stage.Decode).only
+            val branch   = active.where(_.stage === Stage.Execute).only
+            squashed.event("squash") { "by" := branch; active.remove(squashed); squashed.destroy() }
+         }
       }
       .otherwise
       {
@@ -348,7 +376,23 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
          exe_reg_ctrl_mem_typ  := io.ctl.mem_typ
          exe_reg_ctrl_csr_cmd  := io.ctl.csr_cmd
          exe_reg_ctrl_br_type  := io.ctl.br_type
+
+         when (dec_reg_valid)
+         {
+            val i = active.where(_.stage === Stage.Decode).only
+            i.event("issue") { i.stage := Stage.Execute }
+         }
       }
+   }
+
+   // A hazard holds the instruction in Decode behind the one in Execute: with full bypassing, a load whose result
+   // it reads, or a CSR instruction. One event per run of the stall.
+   val dec_stall_begins = Utils.rising(io.ctl.dec_stall && dec_reg_valid)
+   when (dec_stall_begins)
+   {
+      val waiting = active.where(_.stage === Stage.Decode).only
+      val blocker = active.where(_.stage === Stage.Execute).only
+      waiting.event("stall") { "blocker" := blocker }
    }
 
    //**********************************
@@ -417,6 +461,12 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
       mem_reg_ctrl_mem_typ  := exe_reg_ctrl_mem_typ
       mem_reg_ctrl_wb_sel   := exe_reg_ctrl_wb_sel
       mem_reg_ctrl_csr_cmd  := exe_reg_ctrl_csr_cmd
+
+      when (exe_reg_valid)
+      {
+         val i = active.where(_.stage === Stage.Execute).only
+         i.event("memory") { i.stage := Stage.Memory }
+      }
    }
 
    //**********************************
@@ -476,6 +526,15 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
                   (mem_reg_ctrl_wb_sel === WB_CSR) -> csr.io.rw.rdata
                   ))
 
+   // The instruction in Memory waits for the data memory, holding the whole pipeline. One event per wait. A
+   // misaligned access raises the full stall too, but it traps instead.
+   val mem_wait_begins = Utils.rising(io.ctl.full_stall && mem_reg_valid && !io.ctl.mem_exception)
+   when (mem_wait_begins)
+   {
+      val i = active.where(_.stage === Stage.Memory).only
+      i.event("mem_wait") {}
+   }
+
 
    //**********************************
    // Writeback Stage
@@ -486,11 +545,34 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
       wb_reg_wbaddr        := mem_reg_wbaddr
       wb_reg_wbdata        := mem_wbdata
       wb_reg_ctrl_rf_wen   := Mux(io.ctl.mem_exception || interrupt_edge, false.B, mem_reg_ctrl_rf_wen)
+
+      when (mem_reg_valid && !io.ctl.mem_exception && !interrupt_edge)
+      {
+         val i = active.where(_.stage === Stage.Memory).only
+         i.event("writeback") { i.stage := Stage.Writeback }
+      }
    }
    .otherwise
    {
       wb_reg_valid         := false.B
       wb_reg_ctrl_rf_wen   := false.B
+   }
+
+   // An exception or interrupt stops the instruction in Memory before Writeback, even during a full stall: the
+   // pipeline kill replaces it with a bubble. This sits here rather than in the Memory update because
+   // interrupt_edge is defined after that update.
+   when (mem_reg_valid && (io.ctl.mem_exception || interrupt_edge))
+   {
+      val i = active.where(_.stage === Stage.Memory).only
+      i.event("trap") { "cause" := csr.io.cause; active.remove(i); i.destroy() }
+   }
+
+   // The instruction in Writeback retires: it writes the register file this cycle, and the CSR file counts it
+   // through csr.io.retire.
+   when (wb_reg_valid)
+   {
+      val i = active.where(_.stage === Stage.Writeback).only
+      i.event("retire") { active.remove(i); i.destroy() }
    }
 
 

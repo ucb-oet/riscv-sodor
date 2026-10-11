@@ -44,6 +44,11 @@ class Sodor5StageConfig extends Config(
   new freechips.rocketchip.subsystem.WithNBanks(0) ++
   new chipyard.config.AbstractConfig)
 
+// Sodor5StageConfig with its EventTrace annotations elaborated; simulate with +eventtrace=<path> to record.
+class TracedSodor5StageConfig extends Config(
+  new chipyard.config.WithEventTrace ++
+  new Sodor5StageConfig)
+
 class SodorUCodeConfig extends Config(
   new sodor.common.WithNSodorCores(1, internalTile = sodor.common.UCodeFactory) ++
   new testchipip.soc.WithNoScratchpads ++
