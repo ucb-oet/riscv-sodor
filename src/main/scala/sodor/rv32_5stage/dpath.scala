@@ -192,7 +192,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
 
       // An exception, an interrupt, or an ecall, ebreak, or mret in Memory drops the instructions in Decode and
       // Execute.
-      active.where(i => i.stage === Stage.Decode || i.stage === Stage.Execute).each { i =>
+      active.where(i => i.stage === Stage.Decode || i.stage === Stage.Execute).iter { i =>
          i.event("flush") { active.remove(i); i.destroy() }
       }
    }
