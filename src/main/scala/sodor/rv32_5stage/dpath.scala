@@ -21,6 +21,7 @@ import sodor.common._
 
 import eventtrace.{EventTrace, Utils}
 import eventtrace.EventTrace.syntax._
+import SodorTrace.{Instruction, Stage}
 
 class DatToCtlIo(implicit val conf: SodorCoreParams) extends Bundle()
 {
@@ -119,9 +120,10 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    val wb_reg_wbdata         = Reg(UInt(conf.xprlen.W))
    val wb_reg_ctrl_rf_wen    = RegInit(false.B)
 
-   // Event tracing: the instructions between entering Decode and leaving the pipeline. Each event that moves or
-   // removes an instruction sits in the update branch it describes, so its enable is that branch's condition.
+   // EventTrace: the instructions between entering Decode and leaving the pipeline. Each event that moves or removes
+   // an instruction sits in the update branch it describes, so its enable is that branch's condition.
    val active = EventTrace.collection(new Instruction)
+   def instructionIn(stage: Stage.Type) = active.where(_.stage === stage).only
 
 
    //**********************************
@@ -208,7 +210,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
          dec_reg_valid := true.B
          dec_reg_inst := if_buffer_out.bits.data
 
-         Instruction.create(event = "decode") { i =>
+         EventTrace.create(new Instruction, event = "decode") { i =>
             i.pc    := if_pc_buffer_out.bits
             i.bits  := if_buffer_out.bits.data
             i.stage := Stage.Decode
@@ -360,8 +362,8 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
          // A taken branch or jump in Execute drops the instruction in Decode.
          when (dec_reg_valid)
          {
-            val squashed = active.where(_.stage === Stage.Decode).only
-            val branch   = active.where(_.stage === Stage.Execute).only
+            val squashed = instructionIn(Stage.Decode)
+            val branch   = instructionIn(Stage.Execute)
             squashed.event("squash") { "by" := branch; active.remove(squashed); squashed.destroy() }
          }
       }
@@ -379,7 +381,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
 
          when (dec_reg_valid)
          {
-            val i = active.where(_.stage === Stage.Decode).only
+            val i = instructionIn(Stage.Decode)
             i.event("issue") { i.stage := Stage.Execute }
          }
       }
@@ -390,8 +392,8 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    val dec_stall_begins = Utils.rising(io.ctl.dec_stall && dec_reg_valid)
    when (dec_stall_begins)
    {
-      val waiting = active.where(_.stage === Stage.Decode).only
-      val blocker = active.where(_.stage === Stage.Execute).only
+      val waiting = instructionIn(Stage.Decode)
+      val blocker = instructionIn(Stage.Execute)
       waiting.event("stall") { "blocker" := blocker }
    }
 
@@ -464,7 +466,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
 
       when (exe_reg_valid)
       {
-         val i = active.where(_.stage === Stage.Execute).only
+         val i = instructionIn(Stage.Execute)
          i.event("memory") { i.stage := Stage.Memory }
       }
    }
@@ -531,7 +533,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    val mem_wait_begins = Utils.rising(io.ctl.full_stall && mem_reg_valid && !io.ctl.mem_exception)
    when (mem_wait_begins)
    {
-      val i = active.where(_.stage === Stage.Memory).only
+      val i = instructionIn(Stage.Memory)
       i.event("mem_wait") {}
    }
 
@@ -548,7 +550,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
 
       when (mem_reg_valid && !io.ctl.mem_exception && !interrupt_edge)
       {
-         val i = active.where(_.stage === Stage.Memory).only
+         val i = instructionIn(Stage.Memory)
          i.event("writeback") { i.stage := Stage.Writeback }
       }
    }
@@ -563,7 +565,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    // interrupt_edge is defined after that update.
    when (mem_reg_valid && (io.ctl.mem_exception || interrupt_edge))
    {
-      val i = active.where(_.stage === Stage.Memory).only
+      val i = instructionIn(Stage.Memory)
       i.event("trap") { "cause" := csr.io.cause; active.remove(i); i.destroy() }
    }
 
@@ -571,7 +573,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    // through csr.io.retire.
    when (wb_reg_valid)
    {
-      val i = active.where(_.stage === Stage.Writeback).only
+      val i = instructionIn(Stage.Writeback)
       i.event("retire") { active.remove(i); i.destroy() }
    }
 
