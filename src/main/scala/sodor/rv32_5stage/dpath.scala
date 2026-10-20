@@ -195,7 +195,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
       // An exception, an interrupt, or an ecall, ebreak, or mret in Memory drops the instructions in Decode and
       // Execute.
       active.where(i => i.stage === Stage.Decode || i.stage === Stage.Execute).iter { i =>
-         i.event("flush") { active.remove(i); i.destroy() }
+         i.event("flush") { active.remove(i); i.abort() }
       }
    }
    .elsewhen (!io.ctl.dec_stall && !io.ctl.full_stall)
@@ -364,7 +364,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
          {
             val squashed = instructionIn(Stage.Decode)
             val branch   = instructionIn(Stage.Execute)
-            squashed.event("squash") { "by" := branch; active.remove(squashed); squashed.destroy() }
+            squashed.event("squash") { active.remove(squashed); squashed.abort(by = branch) }
          }
       }
       .otherwise
@@ -394,7 +394,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    {
       val waiting = instructionIn(Stage.Decode)
       val blocker = instructionIn(Stage.Execute)
-      waiting.event("stall") { "blocker" := blocker }
+      waiting.event("stall") { waiting.blocked(by = blocker) }
    }
 
    //**********************************
@@ -534,7 +534,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    when (mem_wait_begins)
    {
       val i = instructionIn(Stage.Memory)
-      i.event("mem_wait") {}
+      i.event("mem_wait") { i.blocked() }
    }
 
 
@@ -566,7 +566,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    when (mem_reg_valid && (io.ctl.mem_exception || interrupt_edge))
    {
       val i = instructionIn(Stage.Memory)
-      i.event("trap") { "cause" := csr.io.cause; active.remove(i); i.destroy() }
+      i.event("trap") { "cause" := csr.io.cause; active.remove(i); i.abort() }
    }
 
    // The instruction in Writeback retires: it writes the register file this cycle, and the CSR file counts it
@@ -574,7 +574,7 @@ class DatPath(implicit val p: Parameters, val conf: SodorCoreParams) extends Mod
    when (wb_reg_valid)
    {
       val i = instructionIn(Stage.Writeback)
-      i.event("retire") { active.remove(i); i.destroy() }
+      i.event("retire") { active.remove(i); i.complete() }
    }
 
 
